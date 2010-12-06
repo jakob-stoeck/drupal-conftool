@@ -1,0 +1,5 @@
+; $Id$
+name = ConfTool Connect
+description = Bridge between ConfTool and Drupal
+core = 6.x
+package = Balance Meta

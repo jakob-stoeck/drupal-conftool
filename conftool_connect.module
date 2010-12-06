@@ -1,0 +1,421 @@
+<?php
+// $ID$
+
+// Written by Jakob Stoeck - kontakt@stoeck.it
+
+define('CONFTOOL_CONNECT_URL', 'https://www.conftool.com/');
+
+/**
+ * Implements hook_block().
+ *
+ * @param string $op
+ * @param int $delta
+ * @param array $edit
+ * @return string
+ */
+function conftool_connect_block($op = 'list', $delta = 0, $edit = array()) {
+	switch ($op) {
+		case 'list':
+			$blocks[0]['info'] = 'ConfTool Connect Banner ' . t('for registered users');
+			$blocks[0]['cache'] = BLOCK_CACHE_PER_USER;
+			return $blocks;
+
+		case 'view':
+			global $user;
+
+			switch($delta) {
+				case 0:
+					$block['subject'] = variable_get('conftool_connect_conference_text', t('Conference'));
+					// We have to check for a logged in user here (and not in the function) because Drupal does not obey
+					// the $blocks[0]['cache'] directive for anonymous users
+					if($user->uid) {
+						$block['content'] = conftool_connect_banner();
+					} else {
+						$block['content'] = l('Weiter zur Konferenzanmeldung', CONFTOOL_CONNECT_URL . variable_get('conftool_connect_conference_id', ''));
+					}
+				break;
+			}
+
+			return $block;
+	}
+}
+
+/**
+ * Uses system_settings_form
+ */
+function conftool_connect_admin() {
+	$form = array();
+
+	$form['conftool_connect_conference_name'] = array(
+		'#type' => 'textfield',
+		'#title' => t('Conference Name'),
+		'#default_value' => variable_get('conftool_connect_conference_name', 'BALANCEDinnovation'),
+		'#size' => 90,
+		'#maxlength' => 400,
+		'#description' => t('The name of the conference. It is encouraged to add an Organic Group with the same title.'),
+		'#required' => TRUE,
+	);
+
+	$form['conftool_connect_conference_id'] = array(
+		'#type' => 'textfield',
+		'#title' => t('Conference ID'),
+		'#default_value' => variable_get('conftool_connect_conference_id', 'balanced-innovation'),
+		'#size' => 90,
+		'#maxlength' => 400,
+		'#description' => t('The conference ID. Part of the ConfTool URL.'),
+		'#required' => TRUE,
+	);
+
+  $form['conftool_connect_conference_text'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Conference Text'),
+    '#default_value' => variable_get('conftool_connect_conference_text', ''),
+    '#size' => 90,
+    '#maxlength' => 400,
+    '#description' => t('A describing text of the conference.'),
+    '#required' => FALSE,
+  );
+
+  $form['conftool_connect_username'] = array(
+    '#type' => 'textfield',
+    '#title' => t('User Name'),
+    '#default_value' => variable_get('conftool_connect_username', ''),
+    '#size' => 90,
+    '#maxlength' => 400,
+    '#description' => 'Ein ConfTool-Nutzer, der Admin-Zugriff auf die Konferenz hat.',
+    '#required' => FALSE,
+  );
+
+  $form['conftool_connect_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Password'),
+    '#default_value' => variable_get('conftool_connect_password', ''),
+    '#size' => 90,
+    '#maxlength' => 400,
+    '#description' => 'Passwort eines Adminaccounts (wird zum Auslesen der CSV benötigt)',
+    '#required' => FALSE,
+  );
+
+	$form['#submit'][] = 'conftool_connect_admin_submit';
+
+	return system_settings_form($form);
+}
+
+/**
+ * Implements hook_form_submit
+ * 
+ * Assigns users to group
+ */
+function conftool_connect_admin_submit($form, &$form_state) {
+  $synched = conftool_connect_synchronize();
+  
+  if(!$synched) {
+    drupal_set_message(t('ConfTool synchronization did not work.'), 'error');
+  }
+
+	if(!conftool_connect_get_gid_by_name(variable_get('conftool_connect_conference_name', ''))) {
+		drupal_set_message(t('No Organic Group found with the conference name "%name". Please add one. It serves as a flag to users who signed up for this conference.'), array('%name' => variable_get('conftool_connect_conference_name', '')), 'warning');
+	}
+}
+
+/**
+ * Synchronize ConfTool members and their groups with Drupal
+ * 
+ * It subscribes Drupal users to organic groups if
+ *  - the ConfTool user exists in Drupal (same email)
+ *  - the ConfTool conference's event or name exists in Drupal as organic groups
+ *  - the user isn't already subscribed
+ * 
+ * Right now it supports a ConfTool export file of participants from a conference including its events, @see conftool_connect_get_csv()
+ */
+function conftool_connect_synchronize() {
+  global $base_path;
+  
+  $file_path = $_SERVER['DOCUMENT_ROOT'] . $base_path . file_directory_path() . DIRECTORY_SEPARATOR . 'private' . DIRECTORY_SEPARATOR . 'conftool_connect_synchronize.csv';
+
+	if(!file_put_contents($file_path, conftool_connect_get_csv())) {
+	  watchdog('error', 'ConfTool Connect synchronizing did not work.');
+	  return FALSE;
+	}
+  
+  if($users = conftool_connect_import_users($file_path)) {
+		// subscribe users to groups
+		foreach($users as $u) {
+			if(isset($u['email']) && $uid = conftool_connect_get_uid_by_email($u['email'])) {
+				$groups = array();
+				$events = explode("\n", $u['events']);
+				$events[] = variable_get('conftool_connect_conference_name', ''); // By convention we have an organic group which serves as a flag for event membership, with the name of the conference
+
+				foreach ($events as $e) {
+					if($gid = conftool_connect_get_gid_by_name($e)) {
+						if(!og_is_group_member($gid, FALSE, $uid)) {
+							og_save_subscription($gid, $uid, array('is_active' => 1));
+							$groups[] = $e;
+						}
+					}
+				}
+
+				if(!empty($groups)) {
+					drupal_set_message(t('Subscribed user %name to groups %groups.'), array('%name' => $uid, '%groups' => implode(', ', $groups)));
+					watchdog('action', 'Subscribed user %name to groups %groups.', array('%name' => $uid, '%groups' => implode(', ', $groups)));
+				}
+		  }
+		}
+		
+		$success = TRUE;
+	} else {
+	  $success = FALSE;
+	}
+	
+	unlink($file_path);
+	
+	return $success;
+}
+
+/**
+ * Implements hook_cron
+ */
+function conftool_connect_cron() {
+  conftool_connect_synchronize();
+}
+
+function conftool_connect_get_csv() {
+  $conference_id = variable_get('conftool_connect_conference_id', '');
+  if(empty($conference_id)) {
+    return FALSE;
+  }
+
+  $loginUrl = sprintf('%s/index.php?page=login', CONFTOOL_CONNECT_URL . $conference_id);
+  $loginOptions = array(
+  	'ctusername' => variable_get('conftool_connect_username', ''),
+  	'ctpassword' => variable_get('conftool_connect_password', ''),
+  	'cmd_login' => 'yes',
+  	'cmd_login' => 'Anmelden / Login'
+  );
+
+  $importUrl = sprintf('%s/index.php?page=adminExport', CONFTOOL_CONNECT_URL . $conference_id);
+  $importOptions = array(
+  	'timestamp=' => time(),
+  	'page' => 'adminExport',
+  	'form_userstatus' => '0',
+  	'form_track' => '-',
+  	'form_status' => '-',
+  	'form_export_select' => 'participants',
+  	'form_export_participants_options[]' => 'events',
+  	'form_event' => '0',
+  	'form_include_deleted' => '0',
+  	'form_export_format' => 'csv_comma',
+  	'form_export_header' => 'default',
+  	'cmd_create_export' => 'Export-Datei erzeugen'
+  );
+
+  conftool_connect_curl($loginUrl, $loginOptions);
+  sleep(1);
+  return conftool_connect_curl($importUrl, $importOptions, TRUE);
+}
+
+function conftool_connect_curl($url, $options, $close = FALSE) {
+  global $base_path;
+
+	$cookieFile = $_SERVER['DOCUMENT_ROOT'] . $base_path . file_directory_path() . DIRECTORY_SEPARATOR . 'private' . DIRECTORY_SEPARATOR . 'conftool_connect_cookies.txt';
+	
+	static $ch;
+	if(!$ch) {
+		unlink($cookieFile);
+		$ch = curl_init();
+	}
+
+	curl_setopt_array($ch, array(
+		CURLOPT_COOKIEFILE => $cookieFile,
+		CURLOPT_COOKIEJAR => $cookieFile,
+		CURLOPT_POST => 1,
+		CURLOPT_POSTFIELDS => conftool_connect_querify($options),
+		CURLOPT_SSL_VERIFYHOST => 0,
+		CURLOPT_URL => $url,
+		CURLOPT_USERAGENT => 'Mozilla/4.0 (compatible; MSIE 5.01; Windows NT 5.0)',
+	  CURLOPT_RETURNTRANSFER => true,
+	  CURLOPT_SSL_VERIFYPEER => false,
+	  CURLOPT_VERBOSE => 0
+	));
+
+	$result = curl_exec($ch);
+
+	if($close === TRUE) {
+		curl_close($ch);
+		unlink($cookieFile);
+	}
+
+	return $result;
+}
+
+function conftool_connect_querify($options) {
+	$query = '';
+	foreach($options as $key => $value) {
+		$query .= '&' . urlencode($key) . '=' . urlencode($value);
+	}
+	return substr($query, 1); // cuts first '&'
+}
+
+/**
+ * Get an OG nid by searching for its title
+ * 
+ * If ConfTool Connect finds an Organic Group with the same name as an event in ConfTool, it automatically synchronizes memberships
+ * 
+ * @param string $name
+ *   The node title
+ * @todo map conftool event names to other organic group names in settings
+ */
+function conftool_connect_get_gid_by_name($name) {
+	static $gids;
+
+	if(!isset($gids[$name])) {
+  	// There are exceptions when you don't want an og with the same title as the conftool event
+  	// conftool event name => og title
+  	$map = array('Nachwuchswissenschaftler' => 'Young Balance');
+
+		$gids[$name] = db_result(db_query('SELECT og.nid AS gid, node.title FROM {node}, {og} WHERE node.nid = og.nid AND node.title = "%s"', in_array($name, $map) ? $map[$name] : $name));
+	}
+	
+	return $gids[$name];
+}
+
+/**
+ * Implements hook_menu()
+ */
+function conftool_connect_menu() {
+	$items = array();
+
+	$items['admin/settings/conftool_connect'] = array(
+		'title' => 'ConfTool Connect',
+		'description' => 'Edit ConfTool Conect Settings',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('conftool_connect_admin'),
+		'access arguments' => array('access administration pages'),
+		'type' => MENU_NORMAL_ITEM,
+	 );
+
+	return $items;
+}
+
+/**
+ * Get user uid by email
+ * 
+ * @param string $email
+ */
+function conftool_connect_get_uid_by_email($mail) {
+  return db_result(db_query('SELECT uid FROM {users} WHERE mail = "%s"', $mail));
+}
+
+/**
+ * Parses the CSV ConfTool export file and returns all users with their associated properties
+ *
+ * @param array $properties
+ *   conftool columns which should be used
+ * @param string $csv_uri
+ *   path to csv
+ * @return array $conftool_users
+ *   one array for each user
+ */
+function conftool_connect_import_users($csv_uri, $properties = array('email', 'events')) {
+	$max_line_length = 2048;
+	
+	$f = fopen($csv_uri, 'r');
+  if(!$f) {
+    return FALSE;
+  }
+
+	$conftool_users = array();
+
+	// first line of csv file
+	if(!feof($f)) {
+		$header_columns = fgetcsv($f, $max_line_length);
+		if(!empty($header_columns)) {
+			$use_columns = array_intersect($header_columns, $properties); // add right associate keys to use_columns
+			if(!(count($use_columns) == count($properties))) {
+			  drupal_set_message(t('The information to be imported is missing from the file.'), 'error');
+  			return null;
+			}
+		} else {
+			drupal_set_message(t('No users were imported. Did you use the right login credentials?'), 'error');
+			return null;
+		}
+	}
+
+	while(!feof($f)) {
+		$user = fgetcsv($f, $max_line_length);
+		if(!conftool_connect_is_empty_array($user)) {
+			$conftool_users[] = array_combine($use_columns, array_intersect_key($user, $use_columns)); // filter the columns which are in use_columns and replace the associate key (e.g. '28') with its value (e.g. 'email')
+		}
+	}
+
+	fclose($f);
+
+	return $conftool_users;
+}
+
+function conftool_connect_is_empty_array($array) {
+  $empty = TRUE;
+  
+  if(is_array($array)) {
+    foreach($array as $value) {
+      $empty &= empty($value);
+    
+      if($empty === FALSE) {
+        return FALSE;
+      }
+    }
+  }
+  
+  return $empty;
+}
+
+/**
+ * Renders a link to the ConfTool Conference page
+ *
+ * Available Drupal profile fields are mapped to ConfTool profile fields.
+ * This is used to prefill the registration form of ConfTool.
+ *
+ * Due to Drupal caching this method won't invoke for anonymous users.
+ * If user is already in associated group output login link, not register
+ * @return String
+ *   HTML representation of a link
+ */
+function conftool_connect_banner() {
+	global $user;
+
+	// get conftool settings
+	$conference = array(
+		'name' => variable_get('conftool_connect_conference_name', ''),
+		'text' => variable_get('conftool_connect_conference_text', ''),
+		'id'	 => variable_get('conftool_connect_conference_id', ''),
+		);
+
+  $gid = conftool_connect_get_gid_by_name($conference['name']);
+
+  if($gid && array_key_exists($gid, $user->og_groups)) {
+    return l($conference['name'], CONFTOOL_CONNECT_URL . $conference['id']); // route directly to login
+  } else {
+  	$user = user_load($user->uid);
+  	// put info in query variables
+  	$conftool_options['query'] = array_filter(array(
+  		'page' => 'register',
+  		'cmd_pre_populate' => '1',
+  		'form_addr1' => $user->locations[0]["street"],
+  		'form_addr2' => $user->locations[0]["additional"],
+  		'form_city' => $user->locations[0]["city"],
+  		'form_country' => strtoupper($user->locations[0]["country"]),
+  		'form_email' => $user->mail,
+  		'form_fax' => $user->locations[0]["fax"],
+  		'form_firstname' => $user->profile_firstname,
+  		'form_gender' => ($user->profile_salutation == 'Frau' ? '2' : '1'),
+  		'form_name' => $user->profile_lastname,
+  		'form_organisation' => $user->profile_organisation,
+  		'form_phone' => $user->locations[0]["phone"],
+  		'form_title' => $user->profile_title,
+  		'form_username' => $user->name,
+  		'form_zip' => $user->locations[0]["postal_code"],
+  	));
+
+    return l($conference['name'], CONFTOOL_CONNECT_URL . $conference['id'] . '/index.php', $conftool_options); // pre-fill register page
+  }
+}
